@@ -4,16 +4,20 @@
 
 #include "atom/renderer/api/atom_api_spell_check_client.h"
 
-#include <algorithm>
+#include <map>
 #include <vector>
 
 #include "atom/common/native_mate_converters/string16_converter.h"
 #include "base/logging.h"
+#include "base/numerics/safe_conversions.h"
+#include "base/threading/thread_task_runner_handle.h"
+#include "components/spellcheck/renderer/spellcheck_worditerator.h"
 #include "native_mate/converter.h"
 #include "native_mate/dictionary.h"
+#include "native_mate/function_template.h"
+#include "third_party/blink/public/web/web_text_checking_completion.h"
+#include "third_party/blink/public/web/web_text_checking_result.h"
 #include "third_party/icu/source/common/unicode/uscript.h"
-#include "third_party/WebKit/public/web/WebTextCheckingCompletion.h"
-#include "third_party/WebKit/public/web/WebTextCheckingResult.h"
 
 namespace atom {
 
@@ -36,11 +40,37 @@ bool HasWordCharacters(const base::string16& text, int index) {
 
 }  // namespace
 
+class SpellCheckClient::SpellcheckRequest {
+ public:
+  // Map of individual words to list of occurrences in text
+  using WordMap =
+      std::map<base::string16, std::vector<blink::WebTextCheckingResult>>;
+
+  SpellcheckRequest(const base::string16& text,
+                    blink::WebTextCheckingCompletion* completion)
+      : text_(text), completion_(completion) {
+    DCHECK(completion);
+  }
+  ~SpellcheckRequest() {}
+
+  const base::string16& text() const { return text_; }
+  blink::WebTextCheckingCompletion* completion() { return completion_; }
+  WordMap& wordmap() { return word_map_; }
+
+ private:
+  base::string16 text_;  // Text to be checked in this task.
+  WordMap word_map_;     // WordMap to hold distinct words in text
+  // The interface to send the misspelled ranges to WebKit.
+  blink::WebTextCheckingCompletion* completion_;
+
+  DISALLOW_COPY_AND_ASSIGN(SpellcheckRequest);
+};
+
 SpellCheckClient::SpellCheckClient(const std::string& language,
-                                   bool auto_spell_correct_turned_on,
                                    v8::Isolate* isolate,
                                    v8::Local<v8::Object> provider)
-    : isolate_(isolate),
+    : pending_request_param_(nullptr),
+      isolate_(isolate),
       context_(isolate, isolate->GetCurrentContext()),
       provider_(isolate, provider) {
   DCHECK(!context_.IsEmpty());
@@ -56,56 +86,54 @@ SpellCheckClient::~SpellCheckClient() {
   context_.Reset();
 }
 
-void SpellCheckClient::CheckSpelling(
-    const blink::WebString& text,
-    int& misspelling_start,
-    int& misspelling_len,
-    blink::WebVector<blink::WebString>* optional_suggestions) {
-  std::vector<blink::WebTextCheckingResult> results;
-  SpellCheckText(text.Utf16(), true, &results);
-  if (results.size() == 1) {
-    misspelling_start = results[0].location;
-    misspelling_len = results[0].length;
-  }
-}
-
 void SpellCheckClient::RequestCheckingOfText(
     const blink::WebString& textToCheck,
     blink::WebTextCheckingCompletion* completionCallback) {
   base::string16 text(textToCheck.Utf16());
+  // Ignore invalid requests.
   if (text.empty() || !HasWordCharacters(text, 0)) {
     completionCallback->DidCancelCheckingText();
     return;
   }
 
-  std::vector<blink::WebTextCheckingResult> results;
-  SpellCheckText(text, false, &results);
-  completionCallback->DidFinishCheckingText(results);
+  // Clean up the previous request before starting a new request.
+  if (pending_request_param_) {
+    pending_request_param_->completion()->DidCancelCheckingText();
+  }
+
+  pending_request_param_.reset(new SpellcheckRequest(text, completionCallback));
+
+  base::ThreadTaskRunnerHandle::Get()->PostTask(
+      FROM_HERE,
+      base::BindOnce(&SpellCheckClient::SpellCheckText, AsWeakPtr()));
 }
 
-void SpellCheckClient::ShowSpellingUI(bool show) {
+bool SpellCheckClient::IsSpellCheckingEnabled() const {
+  return true;
 }
+
+void SpellCheckClient::ShowSpellingUI(bool show) {}
 
 bool SpellCheckClient::IsShowingSpellingUI() {
   return false;
 }
 
 void SpellCheckClient::UpdateSpellingUIWithMisspelledWord(
-    const blink::WebString& word) {
-}
+    const blink::WebString& word) {}
 
-void SpellCheckClient::SpellCheckText(
-    const base::string16& text,
-    bool stop_at_first_result,
-    std::vector<blink::WebTextCheckingResult>* results) {
-  if (text.empty() || spell_check_.IsEmpty())
+void SpellCheckClient::SpellCheckText() {
+  const auto& text = pending_request_param_->text();
+  if (text.empty() || spell_check_.IsEmpty()) {
+    pending_request_param_->completion()->DidCancelCheckingText();
+    pending_request_param_ = nullptr;
     return;
+  }
 
   if (!text_iterator_.IsInitialized() &&
       !text_iterator_.Initialize(&character_attributes_, true)) {
-      // We failed to initialize text_iterator_, return as spelled correctly.
-      VLOG(1) << "Failed to initialize SpellcheckWordIterator";
-      return;
+    // We failed to initialize text_iterator_, return as spelled correctly.
+    VLOG(1) << "Failed to initialize SpellcheckWordIterator";
+    return;
   }
 
   if (!contraction_iterator_.IsInitialized() &&
@@ -119,63 +147,111 @@ void SpellCheckClient::SpellCheckText(
 
   SpellCheckScope scope(*this);
   base::string16 word;
-  int word_start;
-  int word_length;
-  while (text_iterator_.GetNextWord(&word, &word_start, &word_length)) {
-    // Found a word (or a contraction) that the spellchecker can check the
-    // spelling of.
-    if (SpellCheckWord(scope, word))
+  size_t word_start;
+  size_t word_length;
+  std::vector<base::string16> words;
+  auto& word_map = pending_request_param_->wordmap();
+  blink::WebTextCheckingResult result;
+  for (;;) {  // Run until end of text
+    const auto status =
+        text_iterator_.GetNextWord(&word, &word_start, &word_length);
+    if (status == SpellcheckWordIterator::IS_END_OF_TEXT)
+      break;
+    if (status == SpellcheckWordIterator::IS_SKIPPABLE)
       continue;
+
+    result.location = base::checked_cast<int>(word_start);
+    result.length = base::checked_cast<int>(word_length);
 
     // If the given word is a concatenated word of two or more valid words
     // (e.g. "hello:hello"), we should treat it as a valid word.
-    if (IsValidContraction(scope, word))
-      continue;
-
-    blink::WebTextCheckingResult result;
-    result.location = word_start;
-    result.length = word_length;
-    results->push_back(result);
-
-    if (stop_at_first_result)
-      return;
+    std::vector<base::string16> contraction_words;
+    if (!IsContraction(scope, word, &contraction_words)) {
+      words.push_back(word);
+      word_map[word].push_back(result);
+    } else {
+      // For a contraction, we want check the spellings of each individual
+      // part, but mark the entire word incorrect if any part is misspelled
+      // Hence, we use the same word_start and word_length values for every
+      // part of the contraction.
+      for (const auto& w : contraction_words) {
+        words.push_back(w);
+        word_map[w].push_back(result);
+      }
+    }
   }
+
+  // Send out all the words data to the spellchecker to check
+  SpellCheckWords(scope, words);
 }
 
-bool SpellCheckClient::SpellCheckWord(
+void SpellCheckClient::OnSpellCheckDone(
+    const std::vector<base::string16>& misspelled_words) {
+  std::vector<blink::WebTextCheckingResult> results;
+  auto* const completion_handler = pending_request_param_->completion();
+
+  auto& word_map = pending_request_param_->wordmap();
+
+  // Take each word from the list of misspelled words received, find their
+  // corresponding WebTextCheckingResult that's stored in the map and pass
+  // all the results to blink through the completion callback.
+  for (const auto& word : misspelled_words) {
+    auto iter = word_map.find(word);
+    if (iter != word_map.end()) {
+      // Word found in map, now gather all the occurrences of the word
+      // from the map value
+      auto& words = iter->second;
+      results.insert(results.end(), words.begin(), words.end());
+      words.clear();
+    }
+  }
+  completion_handler->DidFinishCheckingText(results);
+  pending_request_param_ = nullptr;
+}
+
+void SpellCheckClient::SpellCheckWords(
     const SpellCheckScope& scope,
-    const base::string16& word_to_check) const {
-    DCHECK(!scope.spell_check_.IsEmpty());
+    const std::vector<base::string16>& words) {
+  DCHECK(!scope.spell_check_.IsEmpty());
 
-  v8::Local<v8::Value> word = mate::ConvertToV8(isolate_, word_to_check);
-  v8::Local<v8::Value> result =
-      scope.spell_check_->Call(scope.provider_, 1, &word);
+  v8::Local<v8::FunctionTemplate> templ = mate::CreateFunctionTemplate(
+      isolate_, base::Bind(&SpellCheckClient::OnSpellCheckDone, AsWeakPtr()));
 
-  if (!result.IsEmpty() && result->IsBoolean())
-    return result->BooleanValue();
-  else
-    return true;
+  auto context = isolate_->GetCurrentContext();
+  v8::Local<v8::Value> args[] = {mate::ConvertToV8(isolate_, words),
+                                 templ->GetFunction(context).ToLocalChecked()};
+  // Call javascript with the words and the callback function
+  scope.spell_check_->Call(context, scope.provider_, 2, args).IsEmpty();
 }
 
-// Returns whether or not the given string is a valid contraction.
+// Returns whether or not the given string is a contraction.
 // This function is a fall-back when the SpellcheckWordIterator class
 // returns a concatenated word which is not in the selected dictionary
 // (e.g. "in'n'out") but each word is valid.
-bool SpellCheckClient::IsValidContraction(const SpellCheckScope& scope,
-                                          const base::string16& contraction) {
+// Output variable contraction_words will contain individual
+// words in the contraction.
+bool SpellCheckClient::IsContraction(
+    const SpellCheckScope& scope,
+    const base::string16& contraction,
+    std::vector<base::string16>* contraction_words) {
   DCHECK(contraction_iterator_.IsInitialized());
 
   contraction_iterator_.SetText(contraction.c_str(), contraction.length());
 
   base::string16 word;
-  int word_start;
-  int word_length;
+  size_t word_start;
+  size_t word_length;
+  for (auto status =
+           contraction_iterator_.GetNextWord(&word, &word_start, &word_length);
+       status != SpellcheckWordIterator::IS_END_OF_TEXT;
+       status = contraction_iterator_.GetNextWord(&word, &word_start,
+                                                  &word_length)) {
+    if (status == SpellcheckWordIterator::IS_SKIPPABLE)
+      continue;
 
-  while (contraction_iterator_.GetNextWord(&word, &word_start, &word_length)) {
-    if (!SpellCheckWord(scope, word))
-      return false;
+    contraction_words->push_back(word);
   }
-  return true;
+  return contraction_words->size() > 1;
 }
 
 SpellCheckClient::SpellCheckScope::SpellCheckScope(
@@ -185,6 +261,8 @@ SpellCheckClient::SpellCheckScope::SpellCheckScope(
           v8::Local<v8::Context>::New(client.isolate_, client.context_)),
       provider_(client.provider_.NewHandle()),
       spell_check_(client.spell_check_.NewHandle()) {}
+
+SpellCheckClient::SpellCheckScope::~SpellCheckScope() = default;
 
 }  // namespace api
 

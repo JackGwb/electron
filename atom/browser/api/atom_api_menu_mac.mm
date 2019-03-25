@@ -6,37 +6,45 @@
 
 #include "atom/browser/native_window.h"
 #include "atom/browser/unresponsive_suppressor.h"
+#include "atom/common/node_includes.h"
 #include "base/mac/scoped_sending_event.h"
 #include "base/message_loop/message_loop.h"
 #include "base/strings/sys_string_conversions.h"
-#include "brightray/browser/inspectable_web_contents.h"
-#include "brightray/browser/inspectable_web_contents_view.h"
+#include "base/task/post_task.h"
+#include "content/public/browser/browser_task_traits.h"
 #include "content/public/browser/browser_thread.h"
 #include "content/public/browser/web_contents.h"
 
-#include "atom/common/node_includes.h"
-
 using content::BrowserThread;
+
+namespace {
+
+static scoped_nsobject<NSMenu> applicationMenu_;
+
+}  // namespace
 
 namespace atom {
 
 namespace api {
 
 MenuMac::MenuMac(v8::Isolate* isolate, v8::Local<v8::Object> wrapper)
-    : Menu(isolate, wrapper),
-      weak_factory_(this) {
-}
+    : Menu(isolate, wrapper), weak_factory_(this) {}
 
-void MenuMac::PopupAt(Window* window, int x, int y, int positioning_item,
+MenuMac::~MenuMac() = default;
+
+void MenuMac::PopupAt(TopLevelWindow* window,
+                      int x,
+                      int y,
+                      int positioning_item,
                       const base::Closure& callback) {
   NativeWindow* native_window = window->window();
   if (!native_window)
     return;
 
   auto popup = base::Bind(&MenuMac::PopupOnUI, weak_factory_.GetWeakPtr(),
-                          native_window->GetWeakPtr(), window->ID(), x, y,
-                          positioning_item, callback);
-  BrowserThread::PostTask(BrowserThread::UI, FROM_HERE, popup);
+                          native_window->GetWeakPtr(), window->weak_map_id(), x,
+                          y, positioning_item, callback);
+  base::PostTaskWithTraits(FROM_HERE, {BrowserThread::UI}, popup);
 }
 
 void MenuMac::PopupOnUI(const base::WeakPtr<NativeWindow>& native_window,
@@ -47,18 +55,15 @@ void MenuMac::PopupOnUI(const base::WeakPtr<NativeWindow>& native_window,
                         base::Closure callback) {
   if (!native_window)
     return;
-  brightray::InspectableWebContents* web_contents =
-      native_window->inspectable_web_contents();
-  if (!web_contents)
-    return;
+  NSWindow* nswindow = native_window->GetNativeWindow().GetNativeNSWindow();
 
   auto close_callback = base::Bind(
       &MenuMac::OnClosed, weak_factory_.GetWeakPtr(), window_id, callback);
-  popup_controllers_[window_id] = base::scoped_nsobject<AtomMenuController>(
-      [[AtomMenuController alloc] initWithModel:model()
-                          useDefaultAccelerator:NO]);
+  popup_controllers_[window_id] = base::scoped_nsobject<AtomMenuController>([
+      [AtomMenuController alloc] initWithModel:model()
+                         useDefaultAccelerator:NO]);
   NSMenu* menu = [popup_controllers_[window_id] menu];
-  NSView* view = web_contents->GetView()->GetNativeView();
+  NSView* view = [nswindow contentView];
 
   // Which menu item to show.
   NSMenuItem* item = nil;
@@ -68,7 +73,6 @@ void MenuMac::PopupOnUI(const base::WeakPtr<NativeWindow>& native_window,
   // (-1, -1) means showing on mouse location.
   NSPoint position;
   if (x == -1 || y == -1) {
-    NSWindow* nswindow = native_window->GetNativeWindow();
     position = [view convertPoint:[nswindow mouseLocationOutsideOfEventStream]
                          fromView:nil];
   } else {
@@ -94,8 +98,7 @@ void MenuMac::PopupOnUI(const base::WeakPtr<NativeWindow>& native_window,
 
   [popup_controllers_[window_id] setCloseCallback:close_callback];
   // Make sure events can be pumped while the menu is up.
-  base::MessageLoop::ScopedNestableTaskAllower allow(
-      base::MessageLoop::current());
+  base::MessageLoopCurrent::ScopedNestableTaskAllower allow;
 
   // One of the events that could be pumped is |window.close()|.
   // User-initiated event-tracking loops protect against this by
@@ -132,10 +135,21 @@ void MenuMac::OnClosed(int32_t window_id, base::Closure callback) {
 // static
 void Menu::SetApplicationMenu(Menu* base_menu) {
   MenuMac* menu = static_cast<MenuMac*>(base_menu);
-  base::scoped_nsobject<AtomMenuController> menu_controller(
-      [[AtomMenuController alloc] initWithModel:menu->model_.get()
-                          useDefaultAccelerator:YES]);
-  [NSApp setMainMenu:[menu_controller menu]];
+  base::scoped_nsobject<AtomMenuController> menu_controller([
+      [AtomMenuController alloc] initWithModel:menu->model_.get()
+                         useDefaultAccelerator:YES]);
+
+  NSRunLoop* currentRunLoop = [NSRunLoop currentRunLoop];
+  [currentRunLoop cancelPerformSelector:@selector(setMainMenu:)
+                                 target:NSApp
+                               argument:applicationMenu_];
+  applicationMenu_.reset([[menu_controller menu] retain]);
+  [[NSRunLoop currentRunLoop]
+      performSelector:@selector(setMainMenu:)
+               target:NSApp
+             argument:applicationMenu_
+                order:0
+                modes:[NSArray arrayWithObject:NSDefaultRunLoopMode]];
 
   // Ensure the menu_controller_ is destroyed after main menu is set.
   menu_controller.swap(menu->menu_controller_);

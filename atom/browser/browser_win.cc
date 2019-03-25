@@ -11,6 +11,7 @@
 #include <shobjidl.h>
 
 #include "atom/browser/ui/win/jump_list.h"
+#include "atom/common/application_info.h"
 #include "atom/common/atom_version.h"
 #include "atom/common/native_mate_converters/string16_converter.h"
 #include "base/base_paths.h"
@@ -24,12 +25,11 @@
 #include "base/win/registry.h"
 #include "base/win/win_util.h"
 #include "base/win/windows_version.h"
+#include "ui/events/keycodes/keyboard_code_conversion_win.h"
 
 namespace atom {
 
 namespace {
-
-const wchar_t kAppUserModelIDFormat[] = L"electron.app.$1";
 
 BOOL CALLBACK WindowsEnumerationHandler(HWND hwnd, LPARAM param) {
   DWORD target_process_id = *reinterpret_cast<DWORD*>(param);
@@ -46,7 +46,7 @@ BOOL CALLBACK WindowsEnumerationHandler(HWND hwnd, LPARAM param) {
 
 bool GetProcessExecPath(base::string16* exe) {
   base::FilePath path;
-  if (!PathService::Get(base::FILE_EXE, &path)) {
+  if (!base::PathService::Get(base::FILE_EXE, &path)) {
     LOG(ERROR) << "Error getting app exe path";
     return false;
   }
@@ -62,8 +62,7 @@ bool GetProtocolLaunchPath(mate::Arguments* args, base::string16* exe) {
   // Read in optional args arg
   std::vector<base::string16> launch_args;
   if (args->GetNext(&launch_args) && !launch_args.empty())
-    *exe = base::StringPrintf(L"\"%ls\" %ls \"%%1\"",
-                              exe->c_str(),
+    *exe = base::StringPrintf(L"\"%ls\" %ls \"%%1\"", exe->c_str(),
                               base::JoinString(launch_args, L" ").c_str());
   else
     *exe = base::StringPrintf(L"\"%ls\" \"%%1\"", exe->c_str());
@@ -77,8 +76,7 @@ bool FormatCommandLineString(base::string16* exe,
   }
 
   if (!launch_args.empty()) {
-    *exe = base::StringPrintf(L"%ls %ls",
-                              exe->c_str(),
+    *exe = base::StringPrintf(L"%ls %ls", exe->c_str(),
                               base::JoinString(launch_args, L" ").c_str());
   }
 
@@ -86,6 +84,10 @@ bool FormatCommandLineString(base::string16* exe,
 }
 
 }  // namespace
+
+Browser::UserTask::UserTask() = default;
+Browser::UserTask::UserTask(const UserTask&) = default;
+Browser::UserTask::~UserTask() = default;
 
 void Browser::Focus() {
   // On Windows we just focus on the first window found for this process.
@@ -98,8 +100,8 @@ void Browser::AddRecentDocument(const base::FilePath& path) {
     return;
 
   CComPtr<IShellItem> item;
-  HRESULT hr = SHCreateItemFromParsingName(
-      path.value().c_str(), NULL, IID_PPV_ARGS(&item));
+  HRESULT hr = SHCreateItemFromParsingName(path.value().c_str(), NULL,
+                                           IID_PPV_ARGS(&item));
   if (SUCCEEDED(hr)) {
     SHARDAPPIDINFO info;
     info.psi = item;
@@ -110,8 +112,8 @@ void Browser::AddRecentDocument(const base::FilePath& path) {
 
 void Browser::ClearRecentDocuments() {
   CComPtr<IApplicationDestinations> destinations;
-  if (FAILED(destinations.CoCreateInstance(CLSID_ApplicationDestinations,
-                                           NULL, CLSCTX_INPROC_SERVER)))
+  if (FAILED(destinations.CoCreateInstance(CLSID_ApplicationDestinations, NULL,
+                                           CLSCTX_INPROC_SERVER)))
     return;
   if (FAILED(destinations->SetAppID(GetAppUserModelID())))
     return;
@@ -119,8 +121,7 @@ void Browser::ClearRecentDocuments() {
 }
 
 void Browser::SetAppUserModelID(const base::string16& name) {
-  app_user_model_id_ = name;
-  SetCurrentProcessExplicitAppUserModelID(app_user_model_id_.c_str());
+  atom::SetAppUserModelID(name);
 }
 
 bool Browser::SetUserTasks(const std::vector<UserTask>& tasks) {
@@ -191,8 +192,8 @@ bool Browser::RemoveAsDefaultProtocolClient(const std::string& protocol,
     base::win::RegKey protocolKey;
     base::string16 protocolPath = keyPath + wprotocol;
 
-    if (SUCCEEDED(protocolKey
-      .Open(root, protocolPath.c_str(), KEY_ALL_ACCESS))) {
+    if (SUCCEEDED(
+            protocolKey.Open(root, protocolPath.c_str(), KEY_ALL_ACCESS))) {
       protocolKey.DeleteValue(L"URL Protocol");
 
       // Overwrite the default value to be empty, we can't delete it right away
@@ -210,7 +211,7 @@ bool Browser::RemoveAsDefaultProtocolClient(const std::string& protocol,
 }
 
 bool Browser::SetAsDefaultProtocolClient(const std::string& protocol,
-                                        mate::Arguments* args) {
+                                         mate::Arguments* args) {
   // HKEY_CLASSES_ROOT
   //    $PROTOCOL
   //       (Default) = "URL:$NAME"
@@ -324,17 +325,12 @@ Browser::LoginItemSettings Browser::GetLoginItemSettings(
 }
 
 PCWSTR Browser::GetAppUserModelID() {
-  if (app_user_model_id_.empty()) {
-    SetAppUserModelID(base::ReplaceStringPlaceholders(
-        kAppUserModelIDFormat, base::UTF8ToUTF16(GetName()), nullptr));
-  }
-
-  return app_user_model_id_.c_str();
+  return GetRawAppUserModelID();
 }
 
 std::string Browser::GetExecutableFileVersion() const {
   base::FilePath path;
-  if (PathService::Get(base::FILE_EXE, &path)) {
+  if (base::PathService::Get(base::FILE_EXE, &path)) {
     base::ThreadRestrictions::ScopedAllowIO allow_io;
     std::unique_ptr<FileVersionInfo> version_info(
         FileVersionInfo::CreateFileVersionInfo(path));
@@ -345,14 +341,31 @@ std::string Browser::GetExecutableFileVersion() const {
 }
 
 std::string Browser::GetExecutableFileProductName() const {
-  base::FilePath path;
-  if (PathService::Get(base::FILE_EXE, &path)) {
-    std::unique_ptr<FileVersionInfo> version_info(
-        FileVersionInfo::CreateFileVersionInfo(path));
-    return base::UTF16ToUTF8(version_info->product_name());
-  }
+  return GetApplicationName();
+}
 
-  return ATOM_PRODUCT_NAME;
+bool Browser::IsEmojiPanelSupported() {
+  // emoji picker is supported on Windows 10's Spring 2018 update & above.
+  return base::win::GetVersion() >= base::win::Version::VERSION_WIN10_RS4;
+}
+
+void Browser::ShowEmojiPanel() {
+  // This sends Windows Key + '.' (both keydown and keyup events).
+  // "SendInput" is used because Windows needs to receive these events and
+  // open the Emoji picker.
+  INPUT input[4] = {};
+  input[0].type = INPUT_KEYBOARD;
+  input[0].ki.wVk = ui::WindowsKeyCodeForKeyboardCode(ui::VKEY_COMMAND);
+  input[1].type = INPUT_KEYBOARD;
+  input[1].ki.wVk = ui::WindowsKeyCodeForKeyboardCode(ui::VKEY_OEM_PERIOD);
+
+  input[2].type = INPUT_KEYBOARD;
+  input[2].ki.wVk = ui::WindowsKeyCodeForKeyboardCode(ui::VKEY_COMMAND);
+  input[2].ki.dwFlags |= KEYEVENTF_KEYUP;
+  input[3].type = INPUT_KEYBOARD;
+  input[3].ki.wVk = ui::WindowsKeyCodeForKeyboardCode(ui::VKEY_OEM_PERIOD);
+  input[3].ki.dwFlags |= KEYEVENTF_KEYUP;
+  ::SendInput(4, input, sizeof(INPUT));
 }
 
 }  // namespace atom

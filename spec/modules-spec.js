@@ -1,9 +1,11 @@
 const assert = require('assert')
 const Module = require('module')
 const path = require('path')
-const {remote} = require('electron')
-const {BrowserWindow} = remote
-const {closeWindow} = require('./window-helpers')
+const fs = require('fs')
+const { remote } = require('electron')
+const { BrowserWindow } = remote
+const { closeWindow } = require('./window-helpers')
+const features = process.electronBinding('features')
 
 const nativeModulesEnabled = remote.getGlobal('nativeModulesEnabled')
 
@@ -11,26 +13,49 @@ describe('modules support', () => {
   const fixtures = path.join(__dirname, 'fixtures')
 
   describe('third-party module', () => {
-    describe('runas', () => {
-      if (!nativeModulesEnabled) return
-
+    (nativeModulesEnabled ? describe : describe.skip)('echo', () => {
       it('can be required in renderer', () => {
-        require('runas')
+        require('echo')
       })
 
-      it('can be required in node binary', (done) => {
-        const runas = path.join(fixtures, 'module', 'runas.js')
-        const child = require('child_process').fork(runas)
+      it('can be required in node binary', function (done) {
+        if (!features.isRunAsNodeEnabled()) {
+          this.skip()
+          done()
+        }
+
+        const echo = path.join(fixtures, 'module', 'echo.js')
+        const child = require('child_process').fork(echo)
         child.on('message', (msg) => {
-          assert.equal(msg, 'ok')
+          assert.strictEqual(msg, 'ok')
           done()
         })
       })
+
+      if (process.platform === 'win32') {
+        it('can be required if electron.exe is renamed', () => {
+          const { execPath } = remote.process
+          const testExecPath = path.join(path.dirname(execPath), 'test.exe')
+          fs.copyFileSync(execPath, testExecPath)
+          try {
+            const fixture = path.join(fixtures, 'module', 'echo-renamed.js')
+            assert.ok(fs.existsSync(fixture))
+            const child = require('child_process').spawnSync(testExecPath, [fixture])
+            assert.strictEqual(child.status, 0)
+          } finally {
+            fs.unlinkSync(testExecPath)
+          }
+        })
+      }
     })
 
-    describe('ffi', () => {
+    // TODO(alexeykuzmin): Disabled during the Chromium 62 (Node.js 9) upgrade.
+    // Enable it back when "ffi" module supports Node.js 9.
+    // https://github.com/electron/electron/issues/11274
+    xdescribe('ffi', () => {
       before(function () {
-        if (!nativeModulesEnabled || process.platform === 'win32') {
+        if (!nativeModulesEnabled || process.platform === 'win32' ||
+            process.arch === 'arm64') {
           this.skip()
         }
       })
@@ -40,7 +65,7 @@ describe('modules support', () => {
         const libm = ffi.Library('libm', {
           ceil: ['double', ['double']]
         })
-        assert.equal(libm.ceil(1.5), 2)
+        assert.strictEqual(libm.ceil(1.5), 2)
       })
     })
 
@@ -49,7 +74,7 @@ describe('modules support', () => {
       describe('Q.when', () => {
         it('emits the fullfil callback', (done) => {
           Q(true).then((val) => {
-            assert.equal(val, true)
+            assert.strictEqual(val, true)
             done()
           })
         })
@@ -90,7 +115,7 @@ describe('modules support', () => {
     describe('when the path is inside the resources path', () => {
       it('does not include paths outside of the resources path', () => {
         let modulePath = process.resourcesPath
-        assert.deepEqual(Module._nodeModulePaths(modulePath), [
+        assert.deepStrictEqual(Module._nodeModulePaths(modulePath), [
           path.join(process.resourcesPath, 'node_modules')
         ])
 
@@ -100,26 +125,26 @@ describe('modules support', () => {
         assert(nodeModulePaths.includes(path.join(modulePath, '..', 'node_modules')))
 
         modulePath = path.join(process.resourcesPath, 'foo')
-        assert.deepEqual(Module._nodeModulePaths(modulePath), [
+        assert.deepStrictEqual(Module._nodeModulePaths(modulePath), [
           path.join(process.resourcesPath, 'foo', 'node_modules'),
           path.join(process.resourcesPath, 'node_modules')
         ])
 
         modulePath = path.join(process.resourcesPath, 'node_modules', 'foo')
-        assert.deepEqual(Module._nodeModulePaths(modulePath), [
+        assert.deepStrictEqual(Module._nodeModulePaths(modulePath), [
           path.join(process.resourcesPath, 'node_modules', 'foo', 'node_modules'),
           path.join(process.resourcesPath, 'node_modules')
         ])
 
         modulePath = path.join(process.resourcesPath, 'node_modules', 'foo', 'bar')
-        assert.deepEqual(Module._nodeModulePaths(modulePath), [
+        assert.deepStrictEqual(Module._nodeModulePaths(modulePath), [
           path.join(process.resourcesPath, 'node_modules', 'foo', 'bar', 'node_modules'),
           path.join(process.resourcesPath, 'node_modules', 'foo', 'node_modules'),
           path.join(process.resourcesPath, 'node_modules')
         ])
 
         modulePath = path.join(process.resourcesPath, 'node_modules', 'foo', 'node_modules', 'bar')
-        assert.deepEqual(Module._nodeModulePaths(modulePath), [
+        assert.deepStrictEqual(Module._nodeModulePaths(modulePath), [
           path.join(process.resourcesPath, 'node_modules', 'foo', 'node_modules', 'bar', 'node_modules'),
           path.join(process.resourcesPath, 'node_modules', 'foo', 'node_modules'),
           path.join(process.resourcesPath, 'node_modules')
@@ -129,8 +154,8 @@ describe('modules support', () => {
 
     describe('when the path is outside the resources path', () => {
       it('includes paths outside of the resources path', () => {
-        let modulePath = path.resolve('/foo')
-        assert.deepEqual(Module._nodeModulePaths(modulePath), [
+        const modulePath = path.resolve('/foo')
+        assert.deepStrictEqual(Module._nodeModulePaths(modulePath), [
           path.join(modulePath, 'node_modules'),
           path.resolve('/node_modules')
         ])
@@ -143,7 +168,12 @@ describe('modules support', () => {
       let w
 
       beforeEach(() => {
-        w = new BrowserWindow({show: false})
+        w = new BrowserWindow({
+          show: false,
+          webPreferences: {
+            nodeIntegration: true
+          }
+        })
       })
 
       afterEach(async () => {
@@ -154,7 +184,7 @@ describe('modules support', () => {
       it('searches for module under app directory', async () => {
         w.loadURL('about:blank')
         const result = await w.webContents.executeJavaScript('typeof require("q").when')
-        assert.equal(result, 'function')
+        assert.strictEqual(result, 'function')
       })
     })
   })

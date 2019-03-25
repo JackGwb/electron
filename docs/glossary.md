@@ -10,12 +10,6 @@ arbitrary files from it without unpacking the whole file.
 
 The ASAR format was created primarily to improve performance on Windows... TODO
 
-### Brightray
-
-Brightray [was](https://github.com/electron-archive/brightray) a static library
-that made [libchromiumcontent] easier to use in applications. It is now
-deprecated and has been merged into Electron's codebase.
-
 ### CRT
 
 The C Run-time Library (CRT) is the part of the C++ Standard Library that
@@ -34,6 +28,10 @@ supports `dmg` as a build target.
 Input Method Editor. A program that allows users to enter characters and
 symbols not found on their keyboard. For example, this allows users of Latin
 keyboards to input Chinese, Japanese, Korean and Indic characters.
+
+### IDL
+
+Interface description language. Write function signatures and data types in a format that can be used to generate interfaces in Java, C++, JavaScript, etc.
 
 ### IPC
 
@@ -68,11 +66,17 @@ See also: [process](#process), [renderer process](#renderer-process)
 Acronym for Apple's Mac App Store. For details on submitting your app to the
 MAS, see the [Mac App Store Submission Guide].
 
+### Mojo
+
+An IPC system for communicating intra- or inter-process, and that's important because Chrome is keen on being able to split its work into separate processes or not, depending on memory pressures etc.
+
+See https://chromium.googlesource.com/chromium/src/+/master/mojo/README.md
+
 ### native modules
 
 Native modules (also called [addons] in
 Node.js) are modules written in C or C++ that can be loaded into Node.js or
-Electron using the require() function, and used just as if they were an
+Electron using the require() function, and used as if they were an
 ordinary Node.js module. They are used primarily to provide an interface
 between JavaScript running in Node.js and C/C++ libraries.
 

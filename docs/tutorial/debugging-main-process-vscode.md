@@ -22,13 +22,13 @@ $ code electron-quick-start
       "windows": {
         "runtimeExecutable": "${workspaceRoot}/node_modules/.bin/electron.cmd"
       },
-      "args" : ["."]
+      "args" : ["."],
+      "outputCapture": "std"
     }
   ]
 }
 ```
 
-**Note:** For Windows, use `"${workspaceRoot}/node_modules/.bin/electron.cmd"` for `runtimeExecutable`.
 
 ### 3. Debugging
 

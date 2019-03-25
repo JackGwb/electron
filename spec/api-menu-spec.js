@@ -1,8 +1,13 @@
-const assert = require('assert')
+const chai = require('chai')
+const dirtyChai = require('dirty-chai')
 
-const {ipcRenderer, remote} = require('electron')
-const {BrowserWindow, Menu, MenuItem} = remote
-const {closeWindow} = require('./window-helpers')
+const { ipcRenderer, remote } = require('electron')
+const { BrowserWindow, Menu, MenuItem } = remote
+const { sortMenuItems } = require('../lib/browser/api/menu-utils')
+const { closeWindow } = require('./window-helpers')
+
+const { expect } = chai
+chai.use(dirtyChai)
 
 describe('Menu module', () => {
   describe('Menu.buildFromTemplate', () => {
@@ -13,25 +18,48 @@ describe('Menu module', () => {
           extra: 'field'
         }
       ])
-      assert.equal(menu.items[0].extra, 'field')
+      expect(menu.items[0].extra).to.equal('field')
     })
 
-    it('does not modify the specified template', () => {
-      const template = ipcRenderer.sendSync('eval', "var template = [{label: 'text', submenu: [{label: 'sub'}]}];\nrequire('electron').Menu.buildFromTemplate(template);\ntemplate;")
-      assert.deepStrictEqual(template, [
+    it('should be able to accept only MenuItems', () => {
+      const menu = Menu.buildFromTemplate([
+        new MenuItem({ label: 'one' }),
+        new MenuItem({ label: 'two' })
+      ])
+      expect(menu.items[0].label).to.equal('one')
+      expect(menu.items[1].label).to.equal('two')
+    })
+
+    it('should be able to accept only MenuItems in a submenu', () => {
+      const menu = Menu.buildFromTemplate([
         {
-          label: 'text',
+          label: 'one',
           submenu: [
-            {
-              label: 'sub'
-            }
+            new MenuItem({ label: 'two' })
           ]
         }
       ])
+      expect(menu.items[0].label).to.equal('one')
+      expect(menu.items[0].submenu.items[0].label).to.equal('two')
+    })
+
+    it('should be able to accept MenuItems and plain objects', () => {
+      const menu = Menu.buildFromTemplate([
+        new MenuItem({ label: 'one' }),
+        { label: 'two' }
+      ])
+      expect(menu.items[0].label).to.equal('one')
+      expect(menu.items[1].label).to.equal('two')
+    })
+
+    it('does not modify the specified template', () => {
+      const template = [{ label: 'text', submenu: [{ label: 'sub' }] }]
+      const result = ipcRenderer.sendSync('eval', `const template = [{label: 'text', submenu: [{label: 'sub'}]}]\nrequire('electron').Menu.buildFromTemplate(template)\ntemplate`)
+      expect(result).to.deep.equal(template)
     })
 
     it('does not throw exceptions for undefined/null values', () => {
-      assert.doesNotThrow(() => {
+      expect(() => {
         Menu.buildFromTemplate([
           {
             label: 'text',
@@ -42,155 +70,580 @@ describe('Menu module', () => {
             accelerator: null
           }
         ])
-      })
+      }).to.not.throw()
     })
 
-    describe('Menu.buildFromTemplate should reorder based on item position specifiers', () => {
+    it('does throw exceptions for empty objects and null values', () => {
+      expect(() => {
+        Menu.buildFromTemplate([{}, null])
+      }).to.throw(/Invalid template for MenuItem: must have at least one of label, role or type/)
+    })
+
+    it('does throw exception for object without role, label, or type attribute', () => {
+      expect(() => {
+        Menu.buildFromTemplate([{ 'visible': true }])
+      }).to.throw(/Invalid template for MenuItem: must have at least one of label, role or type/)
+    })
+    it('does throw exception for undefined', () => {
+      expect(() => {
+        Menu.buildFromTemplate([undefined])
+      }).to.throw(/Invalid template for MenuItem: must have at least one of label, role or type/)
+    })
+
+    describe('Menu sorting and building', () => {
+      describe('sorts groups', () => {
+        it('does a simple sort', () => {
+          const items = [
+            {
+              label: 'two',
+              id: '2',
+              afterGroupContaining: ['1'] },
+            { type: 'separator' },
+            {
+              id: '1',
+              label: 'one'
+            }
+          ]
+
+          const expected = [
+            {
+              id: '1',
+              label: 'one'
+            },
+            { type: 'separator' },
+            {
+              id: '2',
+              label: 'two',
+              afterGroupContaining: ['1']
+            }
+          ]
+
+          expect(sortMenuItems(items)).to.deep.equal(expected)
+        })
+
+        it('does a simple sort with MenuItems', () => {
+          const firstItem = new MenuItem({ id: '1', label: 'one' })
+          const secondItem = new MenuItem({
+            label: 'two',
+            id: '2',
+            afterGroupContaining: ['1']
+          })
+          const sep = new MenuItem({ type: 'separator' })
+
+          const items = [ secondItem, sep, firstItem ]
+          const expected = [ firstItem, sep, secondItem ]
+
+          expect(sortMenuItems(items)).to.deep.equal(expected)
+        })
+
+        it('resolves cycles by ignoring things that conflict', () => {
+          const items = [
+            {
+              id: '2',
+              label: 'two',
+              afterGroupContaining: ['1']
+            },
+            { type: 'separator' },
+            {
+              id: '1',
+              label: 'one',
+              afterGroupContaining: ['2']
+            }
+          ]
+
+          const expected = [
+            {
+              id: '1',
+              label: 'one',
+              afterGroupContaining: ['2']
+            },
+            { type: 'separator' },
+            {
+              id: '2',
+              label: 'two',
+              afterGroupContaining: ['1']
+            }
+          ]
+
+          expect(sortMenuItems(items)).to.deep.equal(expected)
+        })
+
+        it('ignores references to commands that do not exist', () => {
+          const items = [
+            {
+              id: '1',
+              label: 'one'
+            },
+            { type: 'separator' },
+            {
+              id: '2',
+              label: 'two',
+              afterGroupContaining: ['does-not-exist']
+            }
+          ]
+
+          const expected = [
+            {
+              id: '1',
+              label: 'one'
+            },
+            { type: 'separator' },
+            {
+              id: '2',
+              label: 'two',
+              afterGroupContaining: ['does-not-exist']
+            }
+          ]
+
+          expect(sortMenuItems(items)).to.deep.equal(expected)
+        })
+
+        it('only respects the first matching [before|after]GroupContaining rule in a given group', () => {
+          const items = [
+            {
+              id: '1',
+              label: 'one'
+            },
+            { type: 'separator' },
+            {
+              id: '3',
+              label: 'three',
+              beforeGroupContaining: ['1']
+            },
+            {
+              id: '4',
+              label: 'four',
+              afterGroupContaining: ['2']
+            },
+            { type: 'separator' },
+            {
+              id: '2',
+              label: 'two'
+            }
+          ]
+
+          const expected = [
+            {
+              id: '3',
+              label: 'three',
+              beforeGroupContaining: ['1']
+            },
+            {
+              id: '4',
+              label: 'four',
+              afterGroupContaining: ['2']
+            },
+            { type: 'separator' },
+            {
+              id: '1',
+              label: 'one'
+            },
+            { type: 'separator' },
+            {
+              id: '2',
+              label: 'two'
+            }
+          ]
+
+          expect(sortMenuItems(items)).to.deep.equal(expected)
+        })
+      })
+
+      describe('moves an item to a different group by merging groups', () => {
+        it('can move a group of one item', () => {
+          const items = [
+            {
+              id: '1',
+              label: 'one'
+            },
+            { type: 'separator' },
+            {
+              id: '2',
+              label: 'two'
+            },
+            { type: 'separator' },
+            {
+              id: '3',
+              label: 'three',
+              after: ['1']
+            },
+            { type: 'separator' }
+          ]
+
+          const expected = [
+            {
+              id: '1',
+              label: 'one'
+            },
+            {
+              id: '3',
+              label: 'three',
+              after: ['1']
+            },
+            { type: 'separator' },
+            {
+              id: '2',
+              label: 'two'
+            }
+          ]
+
+          expect(sortMenuItems(items)).to.deep.equal(expected)
+        })
+
+        it("moves all items in the moving item's group", () => {
+          const items = [
+            {
+              id: '1',
+              label: 'one'
+            },
+            { type: 'separator' },
+            {
+              id: '2',
+              label: 'two'
+            },
+            { type: 'separator' },
+            {
+              id: '3',
+              label: 'three',
+              after: ['1']
+            },
+            {
+              id: '4',
+              label: 'four'
+            },
+            { type: 'separator' }
+          ]
+
+          const expected = [
+            {
+              id: '1',
+              label: 'one'
+            },
+            {
+              id: '3',
+              label: 'three',
+              after: ['1']
+            },
+            {
+              id: '4',
+              label: 'four'
+            },
+            { type: 'separator' },
+            {
+              id: '2',
+              label: 'two'
+            }
+          ]
+
+          expect(sortMenuItems(items)).to.deep.equal(expected)
+        })
+
+        it("ignores positions relative to commands that don't exist", () => {
+          const items = [
+            {
+              id: '1',
+              label: 'one'
+            },
+            { type: 'separator' },
+            {
+              id: '2',
+              label: 'two'
+            },
+            { type: 'separator' },
+            {
+              id: '3',
+              label: 'three',
+              after: ['does-not-exist']
+            },
+            {
+              id: '4',
+              label: 'four',
+              after: ['1']
+            },
+            { type: 'separator' }
+          ]
+
+          const expected = [
+            {
+              id: '1',
+              label: 'one'
+            },
+            {
+              id: '3',
+              label: 'three',
+              after: ['does-not-exist']
+            },
+            {
+              id: '4',
+              label: 'four',
+              after: ['1']
+            },
+            { type: 'separator' },
+            {
+              id: '2',
+              label: 'two'
+            }
+          ]
+
+          expect(sortMenuItems(items)).to.deep.equal(expected)
+        })
+
+        it('can handle recursive group merging', () => {
+          const items = [
+            {
+              id: '1',
+              label: 'one',
+              after: ['3']
+            },
+            {
+              id: '2',
+              label: 'two',
+              before: ['1']
+            },
+            {
+              id: '3',
+              label: 'three'
+            }
+          ]
+
+          const expected = [
+            {
+              id: '3',
+              label: 'three'
+            },
+            {
+              id: '2',
+              label: 'two',
+              before: ['1']
+            },
+            {
+              id: '1',
+              label: 'one',
+              after: ['3']
+            }
+          ]
+
+          expect(sortMenuItems(items)).to.deep.equal(expected)
+        })
+
+        it('can merge multiple groups when given a list of before/after commands', () => {
+          const items = [
+            {
+              id: '1',
+              label: 'one'
+            },
+            { type: 'separator' },
+            {
+              id: '2',
+              label: 'two'
+            },
+            { type: 'separator' },
+            {
+              id: '3',
+              label: 'three',
+              after: ['1', '2']
+            }
+          ]
+
+          const expected = [
+            {
+              id: '2',
+              label: 'two'
+            },
+            {
+              id: '1',
+              label: 'one'
+            },
+            {
+              id: '3',
+              label: 'three',
+              after: ['1', '2']
+            }
+          ]
+
+          expect(sortMenuItems(items)).to.deep.equal(expected)
+        })
+
+        it('can merge multiple groups based on both before/after commands', () => {
+          const items = [
+            {
+              id: '1',
+              label: 'one'
+            },
+            { type: 'separator' },
+            {
+              id: '2',
+              label: 'two'
+            },
+            { type: 'separator' },
+            {
+              id: '3',
+              label: 'three',
+              after: ['1'],
+              before: ['2']
+            }
+          ]
+
+          const expected = [
+            {
+              id: '1',
+              label: 'one'
+            },
+            {
+              id: '3',
+              label: 'three',
+              after: ['1'],
+              before: ['2']
+            },
+            {
+              id: '2',
+              label: 'two'
+            }
+          ]
+
+          expect(sortMenuItems(items)).to.deep.equal(expected)
+        })
+      })
+
       it('should position before existing item', () => {
         const menu = Menu.buildFromTemplate([
           {
-            label: '2',
-            id: '2'
+            id: '2',
+            label: 'two'
           }, {
-            label: '3',
-            id: '3'
+            id: '3',
+            label: 'three'
           }, {
-            label: '1',
             id: '1',
-            position: 'before=2'
+            label: 'one',
+            before: ['2']
           }
         ])
-        assert.equal(menu.items[0].label, '1')
-        assert.equal(menu.items[1].label, '2')
-        assert.equal(menu.items[2].label, '3')
+
+        expect(menu.items[0].label).to.equal('one')
+        expect(menu.items[1].label).to.equal('two')
+        expect(menu.items[2].label).to.equal('three')
       })
 
       it('should position after existing item', () => {
         const menu = Menu.buildFromTemplate([
           {
-            label: '1',
-            id: '1'
-          }, {
-            label: '3',
-            id: '3'
-          }, {
-            label: '2',
             id: '2',
-            position: 'after=1'
+            label: 'two',
+            after: ['1']
+          },
+          {
+            id: '1',
+            label: 'one'
+          }, {
+            id: '3',
+            label: 'three'
           }
         ])
-        assert.equal(menu.items[0].label, '1')
-        assert.equal(menu.items[1].label, '2')
-        assert.equal(menu.items[2].label, '3')
+
+        expect(menu.items[0].label).to.equal('one')
+        expect(menu.items[1].label).to.equal('two')
+        expect(menu.items[2].label).to.equal('three')
       })
 
-      it('should position at endof existing separator groups', () => {
-        const menu = Menu.buildFromTemplate([
+      it('should filter excess menu separators', () => {
+        const menuOne = Menu.buildFromTemplate([
           {
-            type: 'separator',
-            id: 'numbers'
+            type: 'separator'
           }, {
-            type: 'separator',
-            id: 'letters'
+            label: 'a'
           }, {
-            label: 'a',
-            id: 'a',
-            position: 'endof=letters'
+            label: 'b'
           }, {
-            label: '1',
-            id: '1',
-            position: 'endof=numbers'
+            label: 'c'
           }, {
-            label: 'b',
-            id: 'b',
-            position: 'endof=letters'
-          }, {
-            label: '2',
-            id: '2',
-            position: 'endof=numbers'
-          }, {
-            label: 'c',
-            id: 'c',
-            position: 'endof=letters'
-          }, {
-            label: '3',
-            id: '3',
-            position: 'endof=numbers'
+            type: 'separator'
           }
         ])
-        assert.equal(menu.items[0].id, 'numbers')
-        assert.equal(menu.items[1].label, '1')
-        assert.equal(menu.items[2].label, '2')
-        assert.equal(menu.items[3].label, '3')
-        assert.equal(menu.items[4].id, 'letters')
-        assert.equal(menu.items[5].label, 'a')
-        assert.equal(menu.items[6].label, 'b')
-        assert.equal(menu.items[7].label, 'c')
-      })
 
-      it('should create separator group if endof does not reference existing separator group', () => {
-        const menu = Menu.buildFromTemplate([
+        expect(menuOne.items).to.have.length(3)
+        expect(menuOne.items[0].label).to.equal('a')
+        expect(menuOne.items[1].label).to.equal('b')
+        expect(menuOne.items[2].label).to.equal('c')
+
+        const menuTwo = Menu.buildFromTemplate([
           {
-            label: 'a',
-            id: 'a',
-            position: 'endof=letters'
+            type: 'separator'
           }, {
-            label: '1',
-            id: '1',
-            position: 'endof=numbers'
+            type: 'separator'
           }, {
-            label: 'b',
-            id: 'b',
-            position: 'endof=letters'
+            label: 'a'
           }, {
-            label: '2',
-            id: '2',
-            position: 'endof=numbers'
+            label: 'b'
           }, {
-            label: 'c',
-            id: 'c',
-            position: 'endof=letters'
+            label: 'c'
           }, {
-            label: '3',
-            id: '3',
-            position: 'endof=numbers'
+            type: 'separator'
+          }, {
+            type: 'separator'
           }
         ])
-        assert.equal(menu.items[0].id, 'letters')
-        assert.equal(menu.items[1].label, 'a')
-        assert.equal(menu.items[2].label, 'b')
-        assert.equal(menu.items[3].label, 'c')
-        assert.equal(menu.items[4].id, 'numbers')
-        assert.equal(menu.items[5].label, '1')
-        assert.equal(menu.items[6].label, '2')
-        assert.equal(menu.items[7].label, '3')
+
+        expect(menuTwo.items).to.have.length(3)
+        expect(menuTwo.items[0].label).to.equal('a')
+        expect(menuTwo.items[1].label).to.equal('b')
+        expect(menuTwo.items[2].label).to.equal('c')
       })
 
       it('should continue inserting items at next index when no specifier is present', () => {
         const menu = Menu.buildFromTemplate([
           {
-            label: '4',
-            id: '4'
+            id: '2',
+            label: 'two'
           }, {
-            label: '5',
-            id: '5'
+            id: '3',
+            label: 'three'
           }, {
-            label: '1',
+            id: '4',
+            label: 'four'
+          }, {
+            id: '5',
+            label: 'five'
+          }, {
             id: '1',
-            position: 'before=4'
-          }, {
-            label: '2',
-            id: '2'
-          }, {
-            label: '3',
-            id: '3'
+            label: 'one',
+            before: ['2']
           }
         ])
-        assert.equal(menu.items[0].label, '1')
-        assert.equal(menu.items[1].label, '2')
-        assert.equal(menu.items[2].label, '3')
-        assert.equal(menu.items[3].label, '4')
-        assert.equal(menu.items[4].label, '5')
+
+        expect(menu.items[0].label).to.equal('one')
+        expect(menu.items[1].label).to.equal('two')
+        expect(menu.items[2].label).to.equal('three')
+        expect(menu.items[3].label).to.equal('four')
+        expect(menu.items[4].label).to.equal('five')
+      })
+
+      it('should continue inserting MenuItems at next index when no specifier is present', () => {
+        const menu = Menu.buildFromTemplate([
+          new MenuItem({
+            id: '2',
+            label: 'two'
+          }), new MenuItem({
+            id: '3',
+            label: 'three'
+          }), new MenuItem({
+            id: '4',
+            label: 'four'
+          }), new MenuItem({
+            id: '5',
+            label: 'five'
+          }), new MenuItem({
+            id: '1',
+            label: 'one',
+            before: ['2']
+          })
+        ])
+
+        expect(menu.items[0].label).to.equal('one')
+        expect(menu.items[1].label).to.equal('two')
+        expect(menu.items[2].label).to.equal('three')
+        expect(menu.items[3].label).to.equal('four')
+        expect(menu.items[4].label).to.equal('five')
       })
     })
   })
@@ -203,61 +656,88 @@ describe('Menu module', () => {
           submenu: [
             {
               label: 'Enter Fullscreen',
-              accelerator: 'Control+Command+F',
+              accelerator: 'ControlCommandF',
               id: 'fullScreen'
-            },
-            {
-              label: 'Exit Fullscreen',
-              accelerator: 'Control+Command+F'
             }
           ]
         }
       ])
       const fsc = menu.getMenuItemById('fullScreen')
-      assert.equal(menu.items[0].submenu.items[0], fsc)
+      expect(menu.items[0].submenu.items[0]).to.equal(fsc)
+    })
+
+    it('should return the separator with the given id', () => {
+      const menu = Menu.buildFromTemplate([
+        {
+          label: 'Item 1',
+          id: 'item_1'
+        },
+        {
+          id: 'separator',
+          type: 'separator'
+        },
+        {
+          label: 'Item 2',
+          id: 'item_2'
+        }
+      ])
+      const separator = menu.getMenuItemById('separator')
+      expect(separator).to.be.an('object')
+      expect(separator).to.equal(menu.items[1])
     })
   })
 
   describe('Menu.insert', () => {
+    it('should throw when attempting to insert at out-of-range indices', () => {
+      const menu = Menu.buildFromTemplate([
+        { label: '1' },
+        { label: '2' },
+        { label: '3' }
+      ])
+
+      const item = new MenuItem({ label: 'badInsert' })
+
+      expect(() => {
+        menu.insert(9999, item)
+      }).to.throw(/Position 9999 cannot be greater than the total MenuItem count/)
+
+      expect(() => {
+        menu.insert(-9999, item)
+      }).to.throw(/Position -9999 cannot be less than 0/)
+    })
+
     it('should store item in @items by its index', () => {
       const menu = Menu.buildFromTemplate([
-        {
-          label: '1'
-        }, {
-          label: '2'
-        }, {
-          label: '3'
-        }
+        { label: '1' },
+        { label: '2' },
+        { label: '3' }
       ])
 
       const item = new MenuItem({ label: 'inserted' })
 
       menu.insert(1, item)
-      assert.equal(menu.items[0].label, '1')
-      assert.equal(menu.items[1].label, 'inserted')
-      assert.equal(menu.items[2].label, '2')
-      assert.equal(menu.items[3].label, '3')
+      expect(menu.items[0].label).to.equal('1')
+      expect(menu.items[1].label).to.equal('inserted')
+      expect(menu.items[2].label).to.equal('2')
+      expect(menu.items[3].label).to.equal('3')
     })
   })
 
   describe('Menu.append', () => {
     it('should add the item to the end of the menu', () => {
       const menu = Menu.buildFromTemplate([
-        {
-          label: '1'
-        }, {
-          label: '2'
-        }, {
-          label: '3'
-        }
+        { label: '1' },
+        { label: '2' },
+        { label: '3' }
       ])
-      const item = new MenuItem({ label: 'inserted' })
 
+      const item = new MenuItem({ label: 'inserted' })
       menu.append(item)
-      assert.equal(menu.items[0].label, '1')
-      assert.equal(menu.items[1].label, '2')
-      assert.equal(menu.items[2].label, '3')
-      assert.equal(menu.items[3].label, 'inserted')
+
+      expect(menu.items[0].label).to.equal('1')
+      expect(menu.items[1].label).to.equal('2')
+      expect(menu.items[2].label).to.equal('3')
+      expect(menu.items[3].label).to.equal('inserted')
     })
   })
 
@@ -266,15 +746,11 @@ describe('Menu module', () => {
     let menu
 
     beforeEach(() => {
-      w = new BrowserWindow({show: false, width: 200, height: 200})
+      w = new BrowserWindow({ show: false, width: 200, height: 200 })
       menu = Menu.buildFromTemplate([
-        {
-          label: '1'
-        }, {
-          label: '2'
-        }, {
-          label: '3'
-        }
+        { label: '1' },
+        { label: '2' },
+        { label: '3' }
       ])
     })
 
@@ -284,53 +760,60 @@ describe('Menu module', () => {
       return closeWindow(w).then(() => { w = null })
     })
 
-    it('returns immediately', () => {
-      const { browserWindow, x, y } = menu.popup(w, {x: 100, y: 101})
-
-      assert.equal(browserWindow, w)
-      assert.equal(x, 100)
-      assert.equal(y, 101)
+    it('throws an error if options is not an object', () => {
+      expect(() => {
+        menu.popup('this is a string, not an object')
+      }).to.throw(/Options must be an object/)
     })
 
-    it('works without a given BrowserWindow and options', () => {
-      const { browserWindow, x, y } = menu.popup({x: 100, y: 101})
-
-      assert.equal(browserWindow.constructor.name, 'BrowserWindow')
-      assert.equal(x, 100)
-      assert.equal(y, 101)
+    it('allows for options to be optional', () => {
+      expect(() => {
+        menu.popup({})
+      }).to.not.throw()
     })
 
-    it('works without a given BrowserWindow', () => {
-      const { browserWindow, x, y } = menu.popup(100, 101)
-
-      assert.equal(browserWindow.constructor.name, 'BrowserWindow')
-      assert.equal(x, 100)
-      assert.equal(y, 101)
+    it('should emit menu-will-show event', (done) => {
+      menu.on('menu-will-show', () => { done() })
+      menu.popup({ window: w })
     })
 
-    it('works without a given BrowserWindow and 0 options', () => {
-      const { browserWindow, x, y } = menu.popup(0, 1)
-
-      assert.equal(browserWindow.constructor.name, 'BrowserWindow')
-      assert.equal(x, 0)
-      assert.equal(y, 1)
-    })
-
-    it('works with a given BrowserWindow and no options', () => {
-      const { browserWindow, x, y } = menu.popup(w, 100, 101)
-
-      assert.equal(browserWindow, w)
-      assert.equal(x, 100)
-      assert.equal(y, 101)
-    })
-
-    it('calls the callback', (done) => {
-      menu.popup({}, () => done())
+    it('should emit menu-will-close event', (done) => {
+      menu.on('menu-will-close', () => { done() })
+      menu.popup({ window: w })
       menu.closePopup()
     })
 
-    it('works with old style', (done) => {
-      menu.popup(w, 100, 101, () => done())
+    it('returns immediately', () => {
+      const input = { window: w, x: 100, y: 101 }
+      const output = menu.popup(input)
+      expect(output.x).to.equal(input.x)
+      expect(output.y).to.equal(input.y)
+      expect(output.browserWindow).to.equal(input.window)
+    })
+
+    it('works without a given BrowserWindow and options', () => {
+      const { browserWindow, x, y } = menu.popup({ x: 100, y: 101 })
+
+      expect(browserWindow.constructor.name).to.equal('BrowserWindow')
+      expect(x).to.equal(100)
+      expect(y).to.equal(101)
+    })
+
+    it('works with a given BrowserWindow, options and callback', (done) => {
+      const { x, y } = menu.popup({
+        window: w,
+        x: 100,
+        y: 101,
+        callback: () => done()
+      })
+
+      expect(x).to.equal(100)
+      expect(y).to.equal(101)
+      menu.closePopup()
+    })
+
+    it('works with a given BrowserWindow, no options, and a callback', (done) => {
+      menu.popup({ window: w, callback: () => done() })
       menu.closePopup()
     })
   })
@@ -338,296 +821,59 @@ describe('Menu module', () => {
   describe('Menu.setApplicationMenu', () => {
     it('sets a menu', () => {
       const menu = Menu.buildFromTemplate([
-        {
-          label: '1'
-        }, {
-          label: '2'
-        }
+        { label: '1' },
+        { label: '2' }
       ])
+
       Menu.setApplicationMenu(menu)
-      assert.notEqual(Menu.getApplicationMenu(), null)
+      expect(Menu.getApplicationMenu()).to.not.be.null()
     })
 
     it('unsets a menu with null', () => {
       Menu.setApplicationMenu(null)
-      assert.equal(Menu.getApplicationMenu(), null)
+      expect(Menu.getApplicationMenu()).to.be.null()
     })
   })
 
-  describe('MenuItem.click', () => {
-    it('should be called with the item object passed', function (done) {
+  describe('menu accelerators', () => {
+    let testFn = it
+    try {
+      // We have other tests that check if native modules work, if we fail to require
+      // robotjs let's skip this test to avoid false negatives
+      require('robotjs')
+    } catch (err) {
+      testFn = it.skip
+    }
+    const sendRobotjsKey = (key, modifiers = [], delay = 500) => {
+      return new Promise((resolve, reject) => {
+        require('robotjs').keyTap(key, modifiers)
+        setTimeout(() => {
+          resolve()
+        }, delay)
+      })
+    }
+
+    testFn('menu accelerators perform the specified action', async () => {
       const menu = Menu.buildFromTemplate([
         {
-          label: 'text',
-          click: function (item) {
-            assert.equal(item.constructor.name, 'MenuItem')
-            assert.equal(item.label, 'text')
-            done()
-          }
+          label: 'Test',
+          submenu: [
+            {
+              label: 'Test Item',
+              accelerator: 'Ctrl+T',
+              click: () => {
+                // Test will succeed, only when the menu accelerator action
+                // is triggered
+                Promise.resolve()
+              },
+              id: 'test'
+            }
+          ]
         }
       ])
-      menu.delegate.executeCommand({}, menu.items[0].commandId)
-    })
-  })
-
-  describe('MenuItem with checked property', () => {
-    it('clicking an checkbox item should flip the checked property', () => {
-      const menu = Menu.buildFromTemplate([
-        {
-          label: 'text',
-          type: 'checkbox'
-        }
-      ])
-      assert.equal(menu.items[0].checked, false)
-      menu.delegate.executeCommand({}, menu.items[0].commandId)
-      assert.equal(menu.items[0].checked, true)
-    })
-
-    it('clicking an radio item should always make checked property true', () => {
-      const menu = Menu.buildFromTemplate([
-        {
-          label: 'text',
-          type: 'radio'
-        }
-      ])
-      menu.delegate.executeCommand({}, menu.items[0].commandId)
-      assert.equal(menu.items[0].checked, true)
-      menu.delegate.executeCommand({}, menu.items[0].commandId)
-      assert.equal(menu.items[0].checked, true)
-    })
-
-    it('at least have one item checked in each group', () => {
-      const template = []
-      for (let i = 0; i <= 10; i++) {
-        template.push({
-          label: `${i}`,
-          type: 'radio'
-        })
-      }
-      template.push({type: 'separator'})
-      for (let i = 12; i <= 20; i++) {
-        template.push({
-          label: `${i}`,
-          type: 'radio'
-        })
-      }
-      const menu = Menu.buildFromTemplate(template)
-      menu.delegate.menuWillShow()
-      assert.equal(menu.items[0].checked, true)
-      assert.equal(menu.items[12].checked, true)
-    })
-
-    it('should assign groupId automatically', () => {
-      const template = []
-      for (let i = 0; i <= 10; i++) {
-        template.push({
-          label: `${i}`,
-          type: 'radio'
-        })
-      }
-      template.push({type: 'separator'})
-      for (let i = 12; i <= 20; i++) {
-        template.push({
-          label: `${i}`,
-          type: 'radio'
-        })
-      }
-      const menu = Menu.buildFromTemplate(template)
-      const groupId = menu.items[0].groupId
-      for (let i = 0; i <= 10; i++) {
-        assert.equal(menu.items[i].groupId, groupId)
-      }
-      for (let i = 12; i <= 20; i++) {
-        assert.equal(menu.items[i].groupId, groupId + 1)
-      }
-    })
-
-    it("setting 'checked' should flip other items' 'checked' property", () => {
-      const template = []
-      for (let i = 0; i <= 10; i++) {
-        template.push({
-          label: `${i}`,
-          type: 'radio'
-        })
-      }
-      template.push({type: 'separator'})
-      for (let i = 12; i <= 20; i++) {
-        template.push({
-          label: `${i}`,
-          type: 'radio'
-        })
-      }
-
-      const menu = Menu.buildFromTemplate(template)
-      for (let i = 0; i <= 10; i++) {
-        assert.equal(menu.items[i].checked, false)
-      }
-      menu.items[0].checked = true
-      assert.equal(menu.items[0].checked, true)
-      for (let i = 1; i <= 10; i++) {
-        assert.equal(menu.items[i].checked, false)
-      }
-      menu.items[10].checked = true
-      assert.equal(menu.items[10].checked, true)
-      for (let i = 0; i <= 9; i++) {
-        assert.equal(menu.items[i].checked, false)
-      }
-      for (let i = 12; i <= 20; i++) {
-        assert.equal(menu.items[i].checked, false)
-      }
-      menu.items[12].checked = true
-      assert.equal(menu.items[10].checked, true)
-      for (let i = 0; i <= 9; i++) {
-        assert.equal(menu.items[i].checked, false)
-      }
-      assert.equal(menu.items[12].checked, true)
-      for (let i = 13; i <= 20; i++) {
-        assert.equal(menu.items[i].checked, false)
-      }
-    })
-  })
-
-  describe('MenuItem command id', () => {
-    it('cannot be overwritten', () => {
-      const item = new MenuItem({label: 'item'})
-
-      const commandId = item.commandId
-      assert(commandId)
-      item.commandId = `${commandId}-modified`
-      assert.equal(item.commandId, commandId)
-    })
-  })
-
-  describe('MenuItem with invalid type', () => {
-    it('throws an exception', () => {
-      assert.throws(() => {
-        Menu.buildFromTemplate([
-          {
-            label: 'text',
-            type: 'not-a-type'
-          }
-        ])
-      }, /Unknown menu item type: not-a-type/)
-    })
-  })
-
-  describe('MenuItem with submenu type and missing submenu', () => {
-    it('throws an exception', () => {
-      assert.throws(() => {
-        Menu.buildFromTemplate([
-          {
-            label: 'text',
-            type: 'submenu'
-          }
-        ])
-      }, /Invalid submenu/)
-    })
-  })
-
-  describe('MenuItem role', () => {
-    it('includes a default label and accelerator', () => {
-      let item = new MenuItem({role: 'close'})
-      assert.equal(item.label, process.platform === 'darwin' ? 'Close Window' : 'Close')
-      assert.equal(item.accelerator, undefined)
-      assert.equal(item.getDefaultRoleAccelerator(), 'CommandOrControl+W')
-
-      item = new MenuItem({role: 'close', label: 'Other', accelerator: 'D'})
-      assert.equal(item.label, 'Other')
-      assert.equal(item.accelerator, 'D')
-      assert.equal(item.getDefaultRoleAccelerator(), 'CommandOrControl+W')
-
-      item = new MenuItem({role: 'help'})
-      assert.equal(item.label, 'Help')
-      assert.equal(item.accelerator, undefined)
-      assert.equal(item.getDefaultRoleAccelerator(), undefined)
-
-      item = new MenuItem({role: 'hide'})
-      assert.equal(item.label, 'Hide Electron Test')
-      assert.equal(item.accelerator, undefined)
-      assert.equal(item.getDefaultRoleAccelerator(), 'Command+H')
-
-      item = new MenuItem({role: 'undo'})
-      assert.equal(item.label, 'Undo')
-      assert.equal(item.accelerator, undefined)
-      assert.equal(item.getDefaultRoleAccelerator(), 'CommandOrControl+Z')
-
-      item = new MenuItem({role: 'redo'})
-      assert.equal(item.label, 'Redo')
-      assert.equal(item.accelerator, undefined)
-      assert.equal(item.getDefaultRoleAccelerator(), process.platform === 'win32' ? 'Control+Y' : 'Shift+CommandOrControl+Z')
-    })
-  })
-
-  describe('MenuItem editMenu', () => {
-    it('includes a default submenu layout when submenu is empty', () => {
-      const item = new MenuItem({role: 'editMenu'})
-      assert.equal(item.label, 'Edit')
-      assert.equal(item.submenu.items[0].role, 'undo')
-      assert.equal(item.submenu.items[1].role, 'redo')
-      assert.equal(item.submenu.items[2].type, 'separator')
-      assert.equal(item.submenu.items[3].role, 'cut')
-      assert.equal(item.submenu.items[4].role, 'copy')
-      assert.equal(item.submenu.items[5].role, 'paste')
-
-      if (process.platform === 'darwin') {
-        assert.equal(item.submenu.items[6].role, 'pasteandmatchstyle')
-        assert.equal(item.submenu.items[7].role, 'delete')
-        assert.equal(item.submenu.items[8].role, 'selectall')
-      }
-
-      if (process.platform === 'win32') {
-        assert.equal(item.submenu.items[6].role, 'delete')
-        assert.equal(item.submenu.items[7].type, 'separator')
-        assert.equal(item.submenu.items[8].role, 'selectall')
-      }
-    })
-
-    it('overrides default layout when submenu is specified', () => {
-      const item = new MenuItem({role: 'editMenu', submenu: [{role: 'close'}]})
-      assert.equal(item.label, 'Edit')
-      assert.equal(item.submenu.items[0].role, 'close')
-    })
-  })
-
-  describe('MenuItem windowMenu', () => {
-    it('includes a default submenu layout when submenu is empty', () => {
-      const item = new MenuItem({role: 'windowMenu'})
-      assert.equal(item.label, 'Window')
-      assert.equal(item.submenu.items[0].role, 'minimize')
-      assert.equal(item.submenu.items[1].role, 'close')
-
-      if (process.platform === 'darwin') {
-        assert.equal(item.submenu.items[2].type, 'separator')
-        assert.equal(item.submenu.items[3].role, 'front')
-      }
-    })
-
-    it('overrides default layout when submenu is specified', () => {
-      const item = new MenuItem({role: 'windowMenu', submenu: [{role: 'copy'}]})
-      assert.equal(item.label, 'Window')
-      assert.equal(item.submenu.items[0].role, 'copy')
-    })
-  })
-
-  describe('MenuItem with custom properties in constructor', () => {
-    it('preserves the custom properties', () => {
-      const template = [{
-        label: 'menu 1',
-        customProp: 'foo',
-        submenu: []
-      }]
-
-      const menu = Menu.buildFromTemplate(template)
-      menu.items[0].submenu.append(new MenuItem({
-        label: 'item 1',
-        customProp: 'bar',
-        overrideProperty: 'oops not allowed'
-      }))
-
-      assert.equal(menu.items[0].customProp, 'foo')
-      assert.equal(menu.items[0].submenu.items[0].label, 'item 1')
-      assert.equal(menu.items[0].submenu.items[0].customProp, 'bar')
-      assert.equal(typeof menu.items[0].submenu.items[0].overrideProperty, 'function')
+      Menu.setApplicationMenu(menu)
+      expect(Menu.getApplicationMenu()).to.not.be.null()
+      await sendRobotjsKey('t', 'control')
     })
   })
 })

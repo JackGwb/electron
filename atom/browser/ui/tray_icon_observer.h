@@ -8,14 +8,16 @@
 #include <string>
 #include <vector>
 
+#include "base/observer_list_types.h"
+
 namespace gfx {
 class Rect;
 class Point;
-}
+}  // namespace gfx
 
 namespace atom {
 
-class TrayIconObserver {
+class TrayIconObserver : public base::CheckedObserver {
  public:
   virtual void OnClicked(const gfx::Rect& bounds,
                          const gfx::Point& location,
@@ -36,7 +38,7 @@ class TrayIconObserver {
   virtual void OnMouseMoved(const gfx::Point& location, int modifiers) {}
 
  protected:
-  virtual ~TrayIconObserver() {}
+  ~TrayIconObserver() override {}
 };
 
 }  // namespace atom

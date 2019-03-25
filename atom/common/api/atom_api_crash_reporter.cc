@@ -16,12 +16,15 @@ using crash_reporter::CrashReporter;
 
 namespace mate {
 
-template<>
+template <>
 struct Converter<CrashReporter::UploadReportResult> {
-  static v8::Local<v8::Value> ToV8(v8::Isolate* isolate,
+  static v8::Local<v8::Value> ToV8(
+      v8::Isolate* isolate,
       const CrashReporter::UploadReportResult& reports) {
     mate::Dictionary dict(isolate, v8::Object::New(isolate));
-    dict.Set("date", v8::Date::New(isolate, reports.first*1000.0));
+    dict.Set("date",
+             v8::Date::New(isolate->GetCurrentContext(), reports.first * 1000.0)
+                 .ToLocalChecked());
     dict.Set("id", reports.second);
     return dict.GetHandle();
   }
@@ -30,15 +33,6 @@ struct Converter<CrashReporter::UploadReportResult> {
 }  // namespace mate
 
 namespace {
-
-// TODO(2.0) Remove
-void SetExtraParameter(const std::string& key, mate::Arguments* args) {
-  std::string value;
-  if (args->GetNext(&value))
-    CrashReporter::GetInstance()->AddExtraParameter(key, value);
-  else
-    CrashReporter::GetInstance()->RemoveExtraParameter(key);
-}
 
 void AddExtraParameter(const std::string& key, const std::string& value) {
   CrashReporter::GetInstance()->AddExtraParameter(key, value);
@@ -52,12 +46,13 @@ std::map<std::string, std::string> GetParameters() {
   return CrashReporter::GetInstance()->GetParameters();
 }
 
-void Initialize(v8::Local<v8::Object> exports, v8::Local<v8::Value> unused,
-                v8::Local<v8::Context> context, void* priv) {
+void Initialize(v8::Local<v8::Object> exports,
+                v8::Local<v8::Value> unused,
+                v8::Local<v8::Context> context,
+                void* priv) {
   mate::Dictionary dict(context->GetIsolate(), exports);
   auto reporter = base::Unretained(CrashReporter::GetInstance());
   dict.SetMethod("start", base::Bind(&CrashReporter::Start, reporter));
-  dict.SetMethod("setExtraParameter", &SetExtraParameter);
   dict.SetMethod("addExtraParameter", &AddExtraParameter);
   dict.SetMethod("removeExtraParameter", &RemoveExtraParameter);
   dict.SetMethod("getParameters", &GetParameters);
@@ -71,4 +66,4 @@ void Initialize(v8::Local<v8::Object> exports, v8::Local<v8::Value> unused,
 
 }  // namespace
 
-NODE_MODULE_CONTEXT_AWARE_BUILTIN(atom_common_crash_reporter, Initialize)
+NODE_LINKED_MODULE_CONTEXT_AWARE(atom_common_crash_reporter, Initialize)
